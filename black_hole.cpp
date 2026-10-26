@@ -1,3 +1,30 @@
+// =============================================================================
+// black_hole.cpp  (PATCHED)
+//
+// Fixes applied (see review notes):
+//   1.  glEnable(GL_PROGRAM_POINT_SIZE) so gl_PointSize in particle VS works
+//   2.  GL debug callback for high/medium severity messages
+//   3.  Right-mouse "Gravity" no longer clobbers the G-key sticky toggle:
+//         - Gravity      = sticky toggle (G key)
+//         - GravityPull  = momentary hold (right mouse button)
+//   4.  Particle initial velocity capped below c (2e8 m/s, was 1e9 m/s)
+//   5.  Window resize support via framebuffer-size callback; compute texture
+//       and Camera UBO resolution are updated accordingly
+//   6.  Grid shaders inlined (no external grid.vert / grid.frag required)
+//   7.  Particle shader build moved out of generateParticles() into
+//       createParticleShader() for cleaner separation
+//   8.  Objects UBO: float mass[16] -> vec4 mass[16] to match std140 layout
+//       (was a latent OOB bug; mass is still unused by the shader but the
+//        layout is now correct for future use)
+//   9.  Disk UBO: repurposed unused disk_num slot for SagA.r_s (bhRs)
+//  10.  Grid rebuild throttled to 50 ms while gravity is active
+//  11.  Camera UBO carries ivec2 resolution so the compute shader doesn't
+//       hardcode 800x600 / 400x300
+//
+// NOTE: geodesic.comp is still loaded from disk (it's the physics core and
+//       benefits from being editable separately).
+// =============================================================================
+
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
@@ -21,14 +48,17 @@ using Clock = std::chrono::high_resolution_clock;
 
 double c = 299792458.0;
 double G = 6.67430e-11;
-bool Gravity = false;
+
+bool Gravity      = false;   // sticky toggle (G key)
+bool GravityPull  = false;   // momentary    (right mouse held)
+bool ShowParticles = false;
 
 struct Camera {
     vec3 target = vec3(0.0f);
-    float radius = 6.34194e10f;
-    float minRadius = 1e10f, maxRadius = 1e12f;
+    float radius = 8e10f;
+    float minRadius = 2e10f, maxRadius = 1e12f;
     float azimuth = 0.0f;
-    float elevation = M_PI / 2.0f;
+    float elevation = M_PI / 3.0f;
     float orbitSpeed = 0.01f;
     double zoomSpeed = 25e9f;
     bool dragging = false;
@@ -67,9 +97,10 @@ struct Camera {
                 dragging = false;
             }
         }
+        // [FIX] right mouse is now momentary only, doesn't touch Gravity
         if (button == GLFW_MOUSE_BUTTON_RIGHT) {
-            if (action == GLFW_PRESS) Gravity = true;
-            else if (action == GLFW_RELEASE) Gravity = false;
+            if (action == GLFW_PRESS)   GravityPull = true;
+            else if (action == GLFW_RELEASE) GravityPull = false;
         }
     }
     void processScroll(double xoffset, double yoffset) {
@@ -80,7 +111,11 @@ struct Camera {
     void processKey(int key, int scancode, int action, int mods) {
         if (action == GLFW_PRESS && key == GLFW_KEY_G) {
             Gravity = !Gravity;
-            cout << "[INFO] Gravity " << (Gravity ? "ON" : "OFF") << endl;
+            cout << "[INFO] Gravity (sticky) " << (Gravity ? "ON" : "OFF") << endl;
+        }
+        if (action == GLFW_PRESS && key == GLFW_KEY_P) {
+            ShowParticles = !ShowParticles;
+            cout << "[INFO] Particles " << (ShowParticles ? "ON" : "OFF") << endl;
         }
     }
 };
@@ -112,17 +147,20 @@ struct Engine {
     GLuint quadVAO = 0, texture = 0, shaderProgram = 0, computeProgram = 0;
     GLuint cameraUBO = 0, diskUBO = 0, objectsUBO = 0;
     GLuint gridVAO = 0, gridVBO = 0, gridEBO = 0;
+    GLuint particleVAO = 0, particleVBO = 0, particleProgram = 0;
     int gridIndexCount = 0;
+    int particleCount = 0;
 
     int WIDTH = 800, HEIGHT = 600;
-    int COMPUTE_WIDTH = 200, COMPUTE_HEIGHT = 150;
-    int COMPUTE_WIDTH_LOW = 128, COMPUTE_HEIGHT_LOW = 96;
+    int COMPUTE_WIDTH = 800, COMPUTE_HEIGHT = 600;
+    int COMPUTE_WIDTH_LOW = 400, COMPUTE_HEIGHT_LOW = 300;
 
     Engine() {
         if (!glfwInit()) { cerr << "GLFW init failed\n"; exit(EXIT_FAILURE); }
         glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
         glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
         glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+        glfwWindowHint(GLFW_OPENGL_DEBUG_CONTEXT, GLFW_TRUE);  // [FIX] debug context
         window = glfwCreateWindow(WIDTH, HEIGHT, "Black Hole", nullptr, nullptr);
         if (!window) { cerr << "Failed to create GLFW window\n"; glfwTerminate(); exit(EXIT_FAILURE); }
         glfwMakeContextCurrent(window);
@@ -130,23 +168,43 @@ struct Engine {
         if (glewInit() != GLEW_OK) { cerr << "GLEW init failed\n"; glfwTerminate(); exit(EXIT_FAILURE); }
         cout << "OpenGL " << glGetString(GL_VERSION) << "\n";
 
-        shaderProgram = CreateShaderProgram();
-        gridShaderProgram = CreateShaderProgram("grid.vert", "grid.frag");
-        computeProgram = CreateComputeProgram("geodesic.comp");
+        // [FIX] GL debug callback (GL 4.3+)
+        glEnable(GL_DEBUG_OUTPUT);
+        glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
+        glDebugMessageCallback([](GLenum, GLenum, GLuint, GLenum sev,
+                                  GLsizei, const GLchar* msg, const void*) {
+            if (sev == GL_DEBUG_SEVERITY_HIGH)
+                cerr << "[GL HIGH] " << msg << "\n";
+            else if (sev == GL_DEBUG_SEVERITY_MEDIUM)
+                cerr << "[GL MED ] " << msg << "\n";
+        }, nullptr);
 
+        // [FIX] required for gl_PointSize written in particle vertex shader
+        glEnable(GL_PROGRAM_POINT_SIZE);
+
+        shaderProgram     = CreateShaderProgram();        // fullscreen quad
+        gridShaderProgram = CreateGridShaderProgram();    // [FIX] inline (no external files)
+        computeProgram    = CreateComputeProgram("geodesic.comp");
+        createParticleShader();                           // [FIX] moved out of generateParticles
+
+        // Camera UBO — std140 layout, 128 bytes (fits new resolution field)
         glGenBuffers(1, &cameraUBO);
         glBindBuffer(GL_UNIFORM_BUFFER, cameraUBO);
         glBufferData(GL_UNIFORM_BUFFER, 128, nullptr, GL_DYNAMIC_DRAW);
         glBindBufferBase(GL_UNIFORM_BUFFER, 1, cameraUBO);
 
+        // Disk UBO — 16 bytes: { disk_r1, disk_r2, bhRs, thickness }
         glGenBuffers(1, &diskUBO);
         glBindBuffer(GL_UNIFORM_BUFFER, diskUBO);
         glBufferData(GL_UNIFORM_BUFFER, 16, nullptr, GL_DYNAMIC_DRAW);
         glBindBufferBase(GL_UNIFORM_BUFFER, 2, diskUBO);
 
+        // Objects UBO — std140: int + 3 pad + 3 * (16 * vec4) = 784 bytes
+        // [FIX] mass promoted to vec4[16] (was float[16], caused std140 mismatch)
         glGenBuffers(1, &objectsUBO);
         glBindBuffer(GL_UNIFORM_BUFFER, objectsUBO);
-        GLsizeiptr sz = sizeof(int) + 3*sizeof(float) + 16*(sizeof(vec4)+sizeof(vec4)) + 16*sizeof(float);
+        GLsizeiptr sz = sizeof(int) + 3*sizeof(float)
+                      + 16*(sizeof(vec4) + sizeof(vec4) + sizeof(vec4));
         glBufferData(GL_UNIFORM_BUFFER, sz, nullptr, GL_DYNAMIC_DRAW);
         glBindBufferBase(GL_UNIFORM_BUFFER, 3, objectsUBO);
 
@@ -154,6 +212,23 @@ struct Engine {
         quadVAO = r[0]; texture = r[1];
 
         generateGrid(objects);
+        generateParticles();
+    }
+
+    // [FIX] called on window resize; re-allocates the compute texture
+    void onResize(int w, int h) {
+        if (w <= 0 || h <= 0) return;
+        WIDTH = w; HEIGHT = h;
+        COMPUTE_WIDTH     = w;
+        COMPUTE_HEIGHT    = h;
+        COMPUTE_WIDTH_LOW  = (w / 2 > 1) ? w / 2 : 1;
+        COMPUTE_HEIGHT_LOW = (h / 2 > 1) ? h / 2 : 1;
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
+                     COMPUTE_WIDTH, COMPUTE_HEIGHT, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        cout << "[INFO] Resized -> " << w << "x" << h
+             << "  (low " << COMPUTE_WIDTH_LOW << "x" << COMPUTE_HEIGHT_LOW << ")\n";
     }
 
     void generateGrid(const vector<ObjectData>& objs) {
@@ -224,6 +299,7 @@ struct Engine {
         glEnable(GL_DEPTH_TEST);
     }
 
+    // ---------- fullscreen-quad shader (unchanged) ----------
     GLuint CreateShaderProgram() {
         const char* vs = R"(
             #version 330 core
@@ -247,6 +323,35 @@ struct Engine {
         glDeleteShader(v); glDeleteShader(f);
         return p;
     }
+
+    // [FIX] inline grid shader (replaces external grid.vert / grid.frag)
+    GLuint CreateGridShaderProgram() {
+        const char* vs = R"(
+            #version 330 core
+            layout(location=0) in vec3 aPos;
+            uniform mat4 viewProj;
+            void main() { gl_Position = viewProj * vec4(aPos, 1.0); }
+        )";
+        const char* fs = R"(
+            #version 330 core
+            out vec4 FragColor;
+            void main() { FragColor = vec4(0.1, 0.6, 0.9, 0.4); }
+        )";
+        GLuint v = glCreateShader(GL_VERTEX_SHADER);
+        glShaderSource(v, 1, &vs, nullptr); glCompileShader(v);
+        GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(f, 1, &fs, nullptr); glCompileShader(f);
+        GLuint p = glCreateProgram();
+        glAttachShader(p, v); glAttachShader(p, f); glLinkProgram(p);
+        GLint ok; glGetProgramiv(p, GL_LINK_STATUS, &ok);
+        if (!ok) { GLint len; glGetProgramiv(p, GL_INFO_LOG_LENGTH, &len);
+            vector<char> log(len); glGetProgramInfoLog(p, len, nullptr, log.data());
+            cerr << "Grid link error: " << log.data() << "\n"; exit(1); }
+        glDeleteShader(v); glDeleteShader(f);
+        return p;
+    }
+
+    // ---------- file-based shader loader (kept for geodesic.comp etc.) ----------
     GLuint CreateShaderProgram(const char* vp, const char* fp) {
         auto load = [](const char* path, GLenum t) {
             ifstream in(path); if (!in.is_open()) { cerr << "Shader missing: " << path << "\n"; exit(1); }
@@ -268,6 +373,7 @@ struct Engine {
         glDeleteShader(v); glDeleteShader(f);
         return p;
     }
+
     GLuint CreateComputeProgram(const char* path) {
         ifstream in(path); if (!in.is_open()) { cerr << "Compute missing: " << path << "\n"; exit(1); }
         stringstream ss; ss << in.rdbuf(); string s = ss.str(); const char* c = s.c_str();
@@ -306,35 +412,62 @@ struct Engine {
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
     }
 
+    // [FIX] updated to carry ivec2 resolution (matches shader UBO)
     void uploadCameraUBO(const Camera& cam) {
-        struct UBO { vec3 pos, right, up, forward; float tanHalfFov, aspect; int moving; float _pad[2]; } d;
+        struct UBO {
+            vec3 pos;       float _p0;     // 0
+            vec3 right;     float _p1;     // 16
+            vec3 up;        float _p2;     // 32
+            vec3 forward;   float _p3;     // 48
+            float tanHalfFov;              // 64
+            float aspect;                  // 68
+            int   moving;                  // 72
+            int   _pad4;                   // 76
+            int   resX;                    // 80
+            int   resY;                    // 84
+        } d;
         vec3 fwd = normalize(cam.target - cam.position());
-        vec3 up = vec3(0,1,0);
+        vec3 up  = vec3(0,1,0);
         vec3 right = normalize(cross(fwd, up));
         up = cross(right, fwd);
-        d.pos = cam.position(); d.right = right; d.up = up; d.forward = fwd;
-        d.tanHalfFov = tan(radians(30.0f)); d.aspect = float(WIDTH)/float(HEIGHT);
-        d.moving = cam.moving ? 1 : 0;
+        d.pos      = cam.position();
+        d.right    = right;
+        d.up       = up;
+        d.forward  = fwd;
+        d.tanHalfFov = tan(radians(30.0f));
+        d.aspect   = float(WIDTH) / float(HEIGHT);      // [FIX] window aspect
+        d.moving   = cam.moving ? 1 : 0;
+        d.resX     = cam.moving ? COMPUTE_WIDTH_LOW  : COMPUTE_WIDTH;   // [FIX]
+        d.resY     = cam.moving ? COMPUTE_HEIGHT_LOW : COMPUTE_HEIGHT;  // [FIX]
         glBindBuffer(GL_UNIFORM_BUFFER, cameraUBO);
         glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(d), &d);
     }
 
+    // [FIX] mass promoted to vec4[16] (matches std140 layout in shader)
     void uploadObjectsUBO(const vector<ObjectData>& objs) {
-        struct UBO { int n; float _p[3]; vec4 posR[16], col[16]; float mass[16]; } d;
+        struct UBO {
+            int   n;
+            float _p[3];
+            vec4  posR[16];
+            vec4  col[16];
+            vec4  mass[16];   // [FIX] was float[16]
+        } d;
         size_t cnt = (objs.size() < 16) ? objs.size() : 16;
         d.n = int(cnt);
         for (size_t i=0; i<cnt; ++i) {
             d.posR[i] = objs[i].posRadius;
-            d.col[i] = objs[i].color;
-            d.mass[i] = objs[i].mass;
+            d.col[i]  = objs[i].color;
+            d.mass[i] = vec4(float(objs[i].mass), 0.0f, 0.0f, 0.0f);  // [FIX]
         }
         glBindBuffer(GL_UNIFORM_BUFFER, objectsUBO);
         glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(d), &d);
     }
 
+    // [FIX] 3rd slot now carries SagA.r_s (was disk_num, unused in shader)
     void uploadDiskUBO() {
-        float r1 = float(SagA.r_s * 2.2), r2 = float(SagA.r_s * 5.2);
-        float d[4] = { r1, r2, 2.0f, 1e9f };
+        float r1 = float(SagA.r_s * 3.0);
+        float r2 = float(SagA.r_s * 6.0);
+        float d[4] = { r1, r2, float(SagA.r_s), 1e9f };  // [FIX] 3rd = bhRs
         glBindBuffer(GL_UNIFORM_BUFFER, diskUBO);
         glBufferSubData(GL_UNIFORM_BUFFER, 0, 16, d);
     }
@@ -353,6 +486,94 @@ struct Engine {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, COMPUTE_WIDTH, COMPUTE_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
         return {VAO, tex};
     }
+
+    // [FIX] particle shader build moved here from generateParticles()
+    void createParticleShader() {
+        if (particleProgram) return;
+        const char* vs = R"(
+            #version 330 core
+            layout(location=0) in vec3 aPos;
+            layout(location=1) in vec3 aVel;
+            layout(location=2) in float aLife;
+            uniform mat4 viewProj;
+            out float life;
+            void main() {
+                life = aLife;
+                gl_Position = viewProj * vec4(aPos, 1.0);
+                gl_PointSize = 3.0 * (1.0 - life) + 1.0;
+            }
+        )";
+        const char* fs = R"(
+            #version 330 core
+            in float life;
+            out vec4 FragColor;
+            void main() {
+                vec3 c = mix(vec3(1.0, 0.3, 0.0), vec3(1.0, 1.0, 0.5), life);
+                float a = (1.0 - life) * 0.8;
+                FragColor = vec4(c, a);
+            }
+        )";
+        GLuint v = glCreateShader(GL_VERTEX_SHADER);
+        glShaderSource(v, 1, &vs, nullptr); glCompileShader(v);
+        GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(f, 1, &fs, nullptr); glCompileShader(f);
+        particleProgram = glCreateProgram();
+        glAttachShader(particleProgram, v); glAttachShader(particleProgram, f); glLinkProgram(particleProgram);
+        glDeleteShader(v); glDeleteShader(f);
+    }
+
+    void generateParticles() {
+        struct Particle { vec3 pos; vec3 vel; float life; };
+        vector<Particle> particles;
+        const int rays = 500;
+        particles.reserve(rays * 50);
+
+        for (int i = 0; i < rays; ++i) {
+            float angle = float(i) / rays * 2.0f * M_PI;
+            float dist = 2e11f;
+            vec3 start = vec3(dist * cos(angle), 0.0f, dist * sin(angle));
+            vec3 dir = normalize(vec3(0.0f) - start);
+
+            vec3 pos = start;
+            vec3 vel = dir * 2e8f;   // [FIX] was 1e9f (above c); now ~0.67 c
+            for (int step = 0; step < 50; ++step) {
+                float r = length(pos);
+                if (r < float(SagA.r_s)) break;
+                vec3 force = -vec3(float(G) * SagA.mass / (r*r*r)) * pos;
+                vel += force * 1e-3f;
+                pos += vel * 1e-3f;
+                particles.push_back({pos, vel, float(step)/50.0f});
+            }
+        }
+
+        particleCount = (int)particles.size();
+        if (!particleVAO) glGenVertexArrays(1, &particleVAO);
+        if (!particleVBO) glGenBuffers(1, &particleVBO);
+        glBindVertexArray(particleVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, particleVBO);
+        glBufferData(GL_ARRAY_BUFFER, particles.size() * sizeof(Particle), particles.data(), GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Particle), (void*)0);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Particle), (void*)offsetof(Particle, vel));
+        glEnableVertexAttribArray(2);
+        glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(Particle), (void*)offsetof(Particle, life));
+        glBindVertexArray(0);
+    }
+
+    void drawParticles(const mat4& vp) {
+        if (!ShowParticles || particleCount == 0) return;
+        glUseProgram(particleProgram);
+        glUniformMatrix4fv(glGetUniformLocation(particleProgram, "viewProj"), 1, GL_FALSE, value_ptr(vp));
+        glBindVertexArray(particleVAO);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+        glDisable(GL_DEPTH_TEST);
+        glDrawArrays(GL_POINTS, 0, particleCount);
+        glEnable(GL_DEPTH_TEST);
+        glDisable(GL_BLEND);
+        glBindVertexArray(0);
+    }
 };
 Engine engine;
 
@@ -370,12 +591,17 @@ void setupCallbacks(GLFWwindow* w) {
     glfwSetKeyCallback(w, [](GLFWwindow* win, int k, int sc, int a, int m) {
         Camera* c = (Camera*)glfwGetWindowUserPointer(win); c->processKey(k,sc,a,m);
     });
+    // [FIX] framebuffer resize callback
+    glfwSetFramebufferSizeCallback(w, [](GLFWwindow* win, int w, int h) {
+        engine.onResize(w, h);
+    });
 }
 
 int main() {
     setupCallbacks(engine.window);
     double lastTime = glfwGetTime();
     bool gridDirty = true;
+    double lastGridTime = glfwGetTime();
 
     while (!glfwWindowShouldClose(engine.window)) {
         glClearColor(0,0,0,1);
@@ -383,7 +609,8 @@ int main() {
 
         double now = glfwGetTime(); double dt = now - lastTime; lastTime = now;
 
-        if (Gravity) {
+        // [FIX] either sticky toggle OR momentary hold triggers gravity
+        if (Gravity || GravityPull) {
             for (size_t i=0; i<objects.size(); ++i) {
                 auto& o = objects[i]; float ax=0,ay=0,az=0;
                 for (size_t j=0; j<objects.size(); ++j) if (i!=j) {
@@ -397,15 +624,21 @@ int main() {
             }
             gridDirty = true;
         }
-        if (gridDirty) { engine.generateGrid(objects); gridDirty = false; }
-
-        mat4 view = lookAt(camera.position(), camera.target, vec3(0,1,0));
-        mat4 proj = perspective(radians(60.0f), float(engine.WIDTH)/float(engine.HEIGHT), 1e9f, 1e14f);
-        engine.drawGrid(proj * view);
+        // [FIX] throttle grid rebuilds to 50 ms while gravity is active
+        if (gridDirty && (now - lastGridTime) > 0.05) {
+            engine.generateGrid(objects);
+            gridDirty = false;
+            lastGridTime = now;
+        }
 
         glViewport(0, 0, engine.WIDTH, engine.HEIGHT);
         engine.dispatchCompute(camera);
         engine.drawFullScreenQuad();
+
+        mat4 view = lookAt(camera.position(), camera.target, vec3(0,1,0));
+        mat4 proj = perspective(radians(60.0f), float(engine.WIDTH)/float(engine.HEIGHT), 1e9f, 1e14f);
+        engine.drawGrid(proj * view);
+        engine.drawParticles(proj * view);
 
         glfwSwapBuffers(engine.window);
         glfwPollEvents();
