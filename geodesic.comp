@@ -56,7 +56,7 @@ layout(std140, binding = 2) uniform Disk {
     float disk_r1;
     float disk_r2;
     float bhRs;                // [FIX] Schwarzschild radius (was disk_num, unused)
-    float thickness;
+    float time;                // [ANIM] clock for disk rotation (was thickness, unused)
 };
 
 layout(std140, binding = 3) uniform Objects {
@@ -66,7 +66,6 @@ layout(std140, binding = 3) uniform Objects {
     vec4 mass[16];             // [FIX] was float mass[16] (std140 mismatch)
 };
 
-const float D_LAMBDA = 2e8;
 const float ESCAPE_R  = 1e12;  // [FIX] was 1e30 (unreachable)
 
 struct Ray {
@@ -172,17 +171,19 @@ void rk4Step(inout Ray ray, float dL) {
     ray.z = ray.r * cos(ray.theta);
 }
 
-bool crossesDisk(vec3 a, vec3 b) {
-    bool cross = (a.y * b.y < 0.0);
-    float r = length(vec2(b.x, b.z));
-    return cross && (r >= disk_r1 && r <= disk_r2);
-}
+// [REMOVED] crossesDisk — replaced by interpolated equatorial-plane crossing
+// in main(): endpoint-only detection quantized the disk into ~0.4·rs bands.
 
 // [FIX] hash-based star sampler (was broken sin-product field)
 float hash13(vec3 p) {
     p = fract(p * 0.1031);
     p += dot(p, p.yzx + 33.33);
     return fract((p.x + p.y) * p.z);
+}
+
+// scattered horizon: blobby noise so the silhouette is irregular, not a clean sphere
+float horizonJitter(vec3 p) {
+    return hash13(floor(p / (bhRs * 0.06)));
 }
 
 void main() {
@@ -199,19 +200,44 @@ void main() {
     Ray ray = initRay(cam.camPos, dir);
 
     vec3 prev = vec3(ray.x, ray.y, ray.z);
-    int maxSteps = cam.moving == 1 ? 300 : 800;
+    int maxSteps = cam.moving == 1 ? 320 : 800;
 
     bool hitBH = false, hitD = false, hitObj = false;
     vec4 objCol; vec3 hitC; float hitR;
+    vec3 hitDiskPos = vec3(0.0);
+    float hitDiskR = 0.0;
+    float minR = ray.r;   // closest approach — drives the smooth corona
 
     for (int i = 0; i < maxSteps; ++i) {
-        if (intercept(ray, bhRs)) { hitBH = true; break; }
+        // round horizon: slight radius jitter only (was 0.88 + 0.24 = very lumpy)
+        float rsEff = bhRs * (0.97 + 0.06 * horizonJitter(vec3(ray.x, ray.y, ray.z)));
+        if (intercept(ray, rsEff)) { hitBH = true; break; }
         if (ray.r > ESCAPE_R) break;       // [FIX] now actually reachable
 
-        rk4Step(ray, D_LAMBDA);
+        // [PERF] adaptive step: proportional to r — fine near horizon, coarse far away.
+        // Inside 3·rs the relative step shrinks 3x: minR is no longer quantized
+        // into ~0.15·rs chunks (that quantization made the photon ring boxy).
+        float dL = 0.1 * ray.r;
+        if (ray.r < 3.0 * bhRs) dL = 0.02 * ray.r;
+        // refine near the disk plane so radial sampling is dense (smoother disk)
+        float cylR = length(vec2(ray.x, ray.z));
+        if (abs(ray.y) < 0.25 * bhRs && cylR < 1.2 * disk_r2) dL = min(dL, 0.06 * disk_r1);
+        rk4Step(ray, dL);
+        minR = min(minR, ray.r);
         vec3 cur = vec3(ray.x, ray.y, ray.z);
 
-        if (crossesDisk(prev, cur)) { hitD = true; break; }
+        // disk hit: interpolate the exact y=0 crossing (endpoint-only was boxy)
+        if (prev.y * cur.y < 0.0) {
+            float t = prev.y / (prev.y - cur.y);
+            vec3 hit = mix(prev, cur, t);
+            float rc = length(vec2(hit.x, hit.z));
+            if (rc >= disk_r1 && rc <= disk_r2) {
+                hitDiskPos = hit;
+                hitDiskR = rc;
+                hitD = true;
+                break;
+            }
+        }
         // [FIX] segment-sphere intersection
         if (interceptObjectSegment(prev, cur, objCol, hitC, hitR)) { hitObj = true; break; }
 
@@ -220,17 +246,37 @@ void main() {
 
     vec4 color = vec4(0.0);
     if (hitD) {
-        float r = length(vec3(ray.x, ray.y, ray.z)) / disk_r2;
-        vec3 dc = vec3(1.0, r, 0.2);
-        color = vec4(dc, r);
+        // normalized radius across the disk
+        float t = (hitDiskR - disk_r1) / (disk_r2 - disk_r1);
+        // smooth rim fade: soft inner & outer edges (no hard circular cuts)
+        float edge = smoothstep(0.0, 0.07, t) * (1.0 - smoothstep(0.93, 1.0, t));
+        // [ANIM] Keplerian differential rotation: inner material orbits faster
+        float ang = atan(hitDiskPos.z, hitDiskPos.x);
+        float rN = max(t, 0.02);
+        float omega = 0.6 / pow(rN, 1.5);   // rad/s (visual clock)
+        // 3 trailing spiral arms + fine drifting rings = swirling gas
+        float spiral = sin(3.0 * ang - time * omega * 3.0 - rN * 9.0);
+        float rings  = sin(rN * 40.0 - time * omega * 2.0);
+        float turb   = 0.75 + 0.18 * spiral + 0.10 * rings;
+        // [ANIM] relativistic beaming: side moving toward camera is brighter
+        vec3 tangentDir = normalize(cross(vec3(0.0, 1.0, 0.0), hitDiskPos));
+        float doppler = 1.0 + 0.6 * dot(tangentDir, normalize(cam.camPos - hitDiskPos));
+        vec3 dc = vec3(1.0, t, 0.2) * turb * doppler * doppler;
+        // fade toward the space background so the rim blends, not cuts
+        vec3 bg = vec3(0.01, 0.005, 0.02);
+        color = vec4(mix(bg, dc, edge), 1.0);
     } else if (hitBH) {
         float r = ray.r / bhRs;
-        float ring   = smoothstep(1.45, 1.55, r) * smoothstep(1.65, 1.45, r);
-        float corona = pow(smoothstep(4.0, 1.2, r), 2.0);
-        vec3 bhColor     = vec3(0.02, 0.0, 0.05);
-        vec3 ringColor   = vec3(1.0, 0.5, 0.0) * ring   * 10.0;
-        vec3 coronaColor = vec3(0.5, 0.1, 0.6) * corona * 3.0;
-        color = vec4(bhColor + ringColor + coronaColor, 1.0);
+        // scattered embers on the horizon surface (denser near the edge)
+        float n = hash13(floor(vec3(ray.x, ray.y, ray.z) / (bhRs * 0.04)));
+        float speck = step(0.72, n) * smoothstep(0.5, 1.0, r);
+        // deep singularity color: rich crimson-red core
+        vec3 bhColor    = vec3(0.25, 0.0, 0.02);
+        // smooth rim glow rising toward the horizon edge (quadratic = soft)
+        float rim = smoothstep(0.7, 1.0, r);
+        vec3 rimColor   = vec3(1.0, 0.45, 0.1) * rim * rim * 1.5;
+        vec3 emberColor = vec3(1.0, 0.5, 0.15) * speck * 2.5;
+        color = vec4(bhColor + rimColor + emberColor, 1.0);
     } else if (hitObj) {
         vec3 P = vec3(ray.x, ray.y, ray.z);
         vec3 N = normalize(P - hitC);
@@ -243,7 +289,19 @@ void main() {
         vec3 star = vec3(0.0);
         float starProb = hash13(dir * 5000.0);
         if (starProb > 0.9995) star = vec3(1.0);
-        color = vec4(0.01, 0.005, 0.02, 1.0) + vec4(star * 0.5, 0.0);
+
+        // [SMOOTH] corona as Gaussian falloff on closest approach:
+        // d = 0 exactly at the silhouette -> brightest, fades smoothly outward.
+        // exp() is C1-continuous -> no banding (smoothstep chain banded).
+        float d  = minR / bhRs - 1.0;
+        float corona = exp(-d * d * 0.30);
+        // photon ring: soft Gaussian centered at 1.5 rs (photon sphere)
+        float pr   = minR / bhRs - 1.5;
+        float ring = exp(-pr * pr * 18.0);
+
+        vec3 glow = vec3(0.5, 0.1, 0.6) * corona * 1.2
+                  + vec3(1.0, 0.55, 0.1) * ring * 2.0;
+        color = vec4(0.01, 0.005, 0.02, 1.0) + vec4(star * 0.5, 0.0) + vec4(glow, 0.0);
     }
     imageStore(outImage, pix, color);
 }
