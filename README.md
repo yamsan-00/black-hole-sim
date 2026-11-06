@@ -80,7 +80,7 @@ Then run the `cmake -B build -S .` and `cmake --build build` steps above (no too
 
 ## **How the code works**
 
-**3D (`black_hole.cpp` + `geodesic.comp`)** — the CPU side owns the window, camera, star N-body integration and uploads all state (camera basis, disk radii + animation clock, object list) to the GPU via std140 UBOs once per frame. The compute shader then traces one camera ray per invocation: it converts the ray to spherical coordinates, integrates the Schwarzschild null geodesic with RK4 (adaptive step, finer inside 3·rₛ and near the disk plane), and shades whichever is hit first — the jittered horizon, the equatorial disk (with spiral/beaming shading), a scene object (segment–sphere test), or the starfield with photon ring/corona glow from the ray's closest approach. The result is written to an RGBA8 image and blitted fullscreen.
+**3D (`black_hole.cpp` + `geodesic.comp`)** — the CPU side owns the window, camera, star N-body integration and uploads all state (camera basis, disk radii + animation clock, object list) to the GPU via std140 UBOs on every rendered frame (idle frames are cached and skip this). The compute shader then traces one camera ray per invocation: it converts the ray to spherical coordinates, integrates the Schwarzschild null geodesic with RK4 (adaptive step, finer inside 3·rₛ and near the disk plane), and shades whichever is hit first — the jittered horizon, the equatorial disk (with spiral/beaming shading), a scene object (segment–sphere test), or the starfield with photon ring/corona glow from the ray's closest approach. The result is written to an RGBA8 image and blitted fullscreen.
 
 **2D (`2D_lensing.cpp`)** — a standalone CPU ray-tracer: light rays integrated around a Schwarzschild potential with RK4, drawing lensed trails in an immediate-mode OpenGL window.
 
@@ -151,7 +151,7 @@ with an **adaptive step** $h = 0.1\,r$, refined to $h = 0.02\,r$ inside $3r_s$ a
 
 ### Event horizon & photon sphere
 
-A ray is captured when $r \le r_s^{\text{eff}}$, with a small hash-noise jitter $r_s^{\text{eff}} \approx r_s(0.97 \pm 0.03)$ for the slightly scattered silhouette. Unstable circular photon orbits exist at the **photon sphere**:
+A ray is captured when $r \le r_s^{\text{eff}}$, with a small hash-noise jitter $r_s^{\text{eff}} \approx r_s\,(1.00 \pm 0.03)$ for the slightly scattered silhouette. Unstable circular photon orbits exist at the **photon sphere**:
 
 $$
 r_{\text{ph}} = \frac{3}{2}\,r_s
@@ -161,7 +161,7 @@ Rays whose closest approach $r_{\min}$ lands near $r_{\text{ph}}$ loop around th
 
 ### Accretion disk
 
-The disk lives in the equatorial plane ($\theta = \pi/2$) between $r_{\text{in}} = 3r_s$ and $r_{\text{out}} = 6r_s$, just outside the ISCO at $3r_s$. Each ray's exact crossing of $y = 0$ is found by linear interpolation between integrator steps:
+The disk lives in the equatorial plane ($\theta = \pi/2$) between $r_{\text{in}} = 3r_s$ and $r_{\text{out}} = 6r_s$ — its inner edge sits exactly at the ISCO, which for a Schwarzschild hole is $r_{\text{ISCO}} = 6GM/c^2 = 3r_s$. Each ray's exact crossing of $y = 0$ is found by linear interpolation between integrator steps:
 
 $$
 t^* = \frac{y_{\text{prev}}}{y_{\text{prev}} - y_{\text{cur}}}, \qquad
@@ -187,8 +187,8 @@ Companion stars integrate the pairwise Newtonian acceleration (semi-implicit Eul
 $$
 \vec a_i = \sum_{j \neq i} \frac{G m_j}{|\vec r_{ij}|^3}\,\vec r_{ij},
 \qquad
-\vec v_{i} \mathrel{+}= \vec a_i\,\Delta t,\quad
-\vec r_{i} \mathrel{+}= \vec v_i\,\Delta t
+\vec v_{i} \to \vec v_{i} + \vec a_i\,\Delta t,\quad
+\vec r_{i} \to \vec r_{i} + \vec v_i\,\Delta t
 $$
 
 Initial velocities are set to circular Keplerian orbits, $v = \sqrt{GM/r}$ (≈ $3.8\times10^7\,\text{m/s}$ at $r = 4\times10^{11}\,$m), so the stars orbit stably instead of falling in. The spacetime grid displaces each vertex vertically by a Flamm-paraboloid-inspired profile:
